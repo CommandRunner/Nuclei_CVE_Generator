@@ -1,20 +1,27 @@
 # Nuclei CVE Generator
 
-A Flask API that automatically generates [Nuclei](https://github.com/projectdiscovery/nuclei) templates for CVEs using AWS Bedrock (Claude) and data from the NIST NVD API.
+A Flask API that automatically generates [Nuclei](https://github.com/projectdiscovery/nuclei) templates for CVEs using real-world PoC data from Exploit-DB and GitHub, powered by Claude AI.
 
 ---
 
 ## How It Works
 
 1. You send a CVE ID to the `/generate` endpoint
-2. It fetches the CVE details from the [NIST NVD API](https://nvd.nist.gov/developers/vulnerabilities)
-3. It builds a structured prompt with the CVE metadata (CVSS score, CWE, affected products, references)
-4. It sends the prompt to Claude via AWS Bedrock
-5. Returns a ready-to-use Nuclei YAML template
+2. It searches **Exploit-DB** for matching exploits and fetches the raw exploit code
+3. It searches **GitHub** for PoC repositories and fetches their README content
+4. It builds a prompt from the real PoC data (HTTP requests, payloads, reproduction steps)
+5. It sends the prompt to Claude and returns a ready-to-use Nuclei YAML template
 
 ---
 
-## Deploying on AWS EC2
+## Setup Options
+
+- **Option A — AWS Bedrock on EC2** (no API key needed, uses IAM roles)
+- **Option B — Anthropic API locally** (simpler, just needs an API key)
+
+---
+
+## Option A: Deploying on AWS EC2
 
 ### 1. Enable Bedrock Model Access
 
@@ -54,8 +61,6 @@ Your EC2 instance needs permission to call Bedrock. The safest way is an IAM rol
 
 ### 4. Connect to the Instance
 
-Once the instance is running, connect via SSH:
-
 ```bash
 ssh -i /path/to/your-key.pem ubuntu@<your-ec2-public-ip>
 ```
@@ -68,8 +73,6 @@ chmod 400 /path/to/your-key.pem
 ---
 
 ### 5. Set Up the Environment
-
-Once connected, run the following:
 
 ```bash
 # Update packages
@@ -94,7 +97,7 @@ pip install -r requirements.txt
 
 ### 6. Verify AWS Access
 
-Since the EC2 instance has the IAM role attached, you don't need to run `aws configure` or store any credentials. Verify it's working:
+Since the EC2 instance has the IAM role attached, you don't need to store any credentials. Verify it's working:
 
 ```bash
 sudo apt install awscli -y
@@ -113,19 +116,9 @@ python main.py
 
 The API will be available at `http://<your-ec2-public-ip>:5000`.
 
-Test it from your local machine:
-
-```bash
-curl -X POST http://<your-ec2-public-ip>:5000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"cve_id": "CVE-2021-44228"}'
-```
-
 ---
 
 ### 8. Run as a Background Service (Optional)
-
-If you want the server to keep running after you disconnect, set it up as a systemd service:
 
 ```bash
 sudo nano /etc/systemd/system/nuclei-cve.service
@@ -157,25 +150,66 @@ sudo systemctl start nuclei-cve
 sudo systemctl status nuclei-cve
 ```
 
-To view logs:
+View logs:
 ```bash
 journalctl -u nuclei-cve -f
 ```
 
 ---
 
-## Local Usage
+## Option B: Running Locally with the Anthropic API (No AWS Required)
 
-**Requirements:**
-- Python 3.9+
-- AWS account with Bedrock access (Claude model enabled in `us-east-1`)
-- AWS credentials configured (`~/.aws/credentials` or environment variables)
+If you don't want to set up AWS, you can swap Bedrock for the Anthropic API directly.
+
+### 1. Get an Anthropic API Key
+
+Sign up at [console.anthropic.com](https://console.anthropic.com) and create an API key.
+
+---
+
+### 2. Install the Anthropic SDK
+
+```bash
+pip install anthropic
+```
+
+Or add it to `requirements.txt`:
+```
+anthropic>=0.25.0
+```
+
+---
+
+### 3. Modify `main.py`
+
+Replace the `call_bedrock` function with the following:
+
+```python
+import anthropic
+
+anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+def call_bedrock(prompt):
+    message = anthropic_client.messages.create(
+        model="claude-3-5-haiku-20241022",
+        max_tokens=4096,
+        temperature=0.2,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return message.content[0].text
+```
+
+You can remove the `boto3` import and the `bedrock` client at the top of the file since they're no longer needed.
+
+---
+
+### 4. Set Your API Key and Run
 
 ```bash
 git clone https://github.com/CommandRunner/Nuclei_CVE_Generator
 cd Nuclei_CVE_Generator
-pip install -r requirements.txt
-aws configure  # enter your AWS access key, secret, and region (us-east-1)
+pip install -r requirements.txt anthropic
+export ANTHROPIC_API_KEY=your_api_key_here
 python main.py
 ```
 
@@ -194,13 +228,18 @@ curl -X POST http://localhost:5000/generate \
 ```json
 {
   "template": "id: CVE-2021-44228\ninfo:\n  name: ...",
-  "cve_info": {
-    "id": "CVE-2021-44228",
-    "description": "...",
-    "cvss_v3": { "score": 10.0, "severity": "CRITICAL", "vector": "..." }
+  "sources": {
+    "exploitdb": [{"id": "...", "title": "...", "url": "..."}],
+    "github": [{"repo": "...", "stars": 100, "url": "..."}]
   }
 }
 ```
+
+**Increase GitHub API rate limit (optional):**
+```bash
+export GITHUB_TOKEN=your_github_token
+```
+Without a token: 10 requests/min. With a token: 30 requests/min.
 
 **Health check:**
 ```bash
