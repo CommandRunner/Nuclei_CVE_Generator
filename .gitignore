@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# AWS credentials - never commit these
+.aws/
+credentials
+*.pem
+
+# Environment variables
+.env
+.env.*
+
+# OS
+.DS_Store

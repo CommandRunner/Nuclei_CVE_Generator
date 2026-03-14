@@ -1,7 +1,7 @@
-```
 from flask import Flask, request, jsonify
 import boto3
 import json
+import re
 import requests
 import time
 
@@ -10,20 +10,18 @@ app = Flask(__name__)
 # AWS Bedrock client
 bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
 
+CVE_ID_PATTERN = re.compile(r'^CVE-\d{4}-\d{4,}$', re.IGNORECASE)
+
 def fetch_cve_nist(cve_id):
     """Fetch CVE data from NIST NVD API 2.0"""
-    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0"
-    params = {
-        'cveId': cve_id
-    }
+    url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    params = {'cveId': cve_id}
 
-    # Add delay to respect rate limits
-    time.sleep(0.6)  # ~1.6 requests per second to stay under limit
+    time.sleep(0.6)  # ~1.6 requests per second to stay under rate limit
 
     try:
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
-
         data = response.json()
         if data.get('totalResults', 0) > 0:
             return data['vulnerabilities'][0]['cve']
@@ -39,6 +37,7 @@ def extract_cve_info(cve_data):
         'description': '',
         'cvss_v3': None,
         'cvss_v2': None,
+        'cvss_v4': None,
         'cwe': [],
         'references': [],
         'cpe_configurations': [],
@@ -46,15 +45,23 @@ def extract_cve_info(cve_data):
         'modified': cve_data.get('lastModified', '')
     }
 
-    # Extract description
-    descriptions = cve_data.get('descriptions', [])
-    for desc in descriptions:
+    # Extract English description
+    for desc in cve_data.get('descriptions', []):
         if desc.get('lang') == 'en':
             cve_info['description'] = desc.get('value', 'No description available')
             break
 
-    # Extract CVSS scores
     metrics = cve_data.get('metrics', {})
+
+    # CVSS v4
+    cvss_v4 = metrics.get('cvssMetricV40')
+    if cvss_v4:
+        cvss_data = cvss_v4[0].get('cvssData', {})
+        cve_info['cvss_v4'] = {
+            'score': cvss_data.get('baseScore'),
+            'severity': cvss_data.get('baseSeverity'),
+            'vector': cvss_data.get('vectorString')
+        }
 
     # CVSS v3.x
     cvss_v3 = metrics.get('cvssMetricV31') or metrics.get('cvssMetricV30')
@@ -76,30 +83,27 @@ def extract_cve_info(cve_data):
             'vector': cvss_data.get('vectorString')
         }
 
-    # Extract CWE
-    weaknesses = cve_data.get('weaknesses', [])
-    for weakness in weaknesses:
+    # CWE
+    for weakness in cve_data.get('weaknesses', []):
         for desc in weakness.get('description', []):
             if desc.get('lang') == 'en':
                 cve_info['cwe'].append(desc.get('value'))
 
-    # Extract references
-    references = cve_data.get('references', [])
-    for ref in references[:5]:  # Limit to 5 references
+    # References (limit to 5)
+    for ref in cve_data.get('references', [])[:5]:
         cve_info['references'].append({
             'url': ref.get('url'),
             'source': ref.get('source'),
             'tags': ref.get('tags', [])
         })
 
-    # Extract CPE configurations (affected products)
-    configurations = cve_data.get('configurations', [])
-    for config in configurations:
+    # Affected products from CPE configurations (limit to 10)
+    for config in cve_data.get('configurations', []):
         for node in config.get('nodes', []):
             for cpe_match in node.get('cpeMatch', []):
                 if cpe_match.get('vulnerable', False):
                     cpe_uri = cpe_match.get('criteria', '')
-                    if cpe_uri:
+                    if cpe_uri and len(cve_info['cpe_configurations']) < 10:
                         cve_info['cpe_configurations'].append(cpe_uri)
 
     return cve_info
@@ -107,64 +111,71 @@ def extract_cve_info(cve_data):
 def generate_enhanced_prompt(cve_info):
     """Generate enhanced prompt with structured CVE data"""
 
-    # Format CVSS information
-    cvss_info = "Not available"
-    if cve_info['cvss_v3']:
-        cvss_info = f"CVSS v3: {cve_info['cvss_v3']['score']} ({cve_info['cvss_v3']['severity']})"
+    # Best available CVSS score
+    if cve_info['cvss_v4']:
+        cvss_info = f"CVSS v4: {cve_info['cvss_v4']['score']} ({cve_info['cvss_v4']['severity']}) - {cve_info['cvss_v4']['vector']}"
+    elif cve_info['cvss_v3']:
+        cvss_info = f"CVSS v3: {cve_info['cvss_v3']['score']} ({cve_info['cvss_v3']['severity']}) - {cve_info['cvss_v3']['vector']}"
     elif cve_info['cvss_v2']:
-        cvss_info = f"CVSS v2: {cve_info['cvss_v2']['score']} ({cve_info['cvss_v2']['severity']})"
+        cvss_info = f"CVSS v2: {cve_info['cvss_v2']['score']} ({cve_info['cvss_v2']['severity']}) - {cve_info['cvss_v2']['vector']}"
+    else:
+        cvss_info = "Not available"
 
-    # Format CWE information
     cwe_info = ', '.join(cve_info['cwe']) if cve_info['cwe'] else 'Not specified'
 
-    # Format affected products (simplified CPE)
     products = []
-    for cpe in cve_info['cpe_configurations'][:3]:  # Limit to 3
-        # Simplify CPE format for readability
+    for cpe in cve_info['cpe_configurations'][:3]:
         parts = cpe.split(':')
         if len(parts) >= 5:
-            vendor = parts[3]
-            product = parts[4]
-            products.append(f"{vendor} {product}")
-
+            products.append(f"{parts[3]} {parts[4]}")
     products_info = ', '.join(products) if products else 'Not specified'
 
-    # Format references
     ref_urls = [ref['url'] for ref in cve_info['references'][:3]]
-    references_info = ', '.join(ref_urls) if ref_urls else 'Not available'
+    references_info = '\n'.join(f"  - {url}" for url in ref_urls) if ref_urls else '  - Not available'
 
-    return f"""
-You are a cybersecurity expert specializing in creating Nuclei templates. Create a comprehensive Nuclei template for this CVE:
+    severity = 'unknown'
+    if cve_info['cvss_v4']:
+        severity = cve_info['cvss_v4']['severity'].lower()
+    elif cve_info['cvss_v3']:
+        severity = cve_info['cvss_v3']['severity'].lower()
+    elif cve_info['cvss_v2']:
+        severity = cve_info['cvss_v2']['severity'].lower()
+
+    return f"""You are a cybersecurity expert specializing in creating Nuclei templates. Create a comprehensive Nuclei template for the following CVE.
 
 CVE ID: {cve_info['id']}
 Description: {cve_info['description']}
 Severity: {cvss_info}
+Nuclei severity field value: {severity}
 Weakness Type (CWE): {cwe_info}
 Affected Products: {products_info}
-References: {references_info}
+References:
+{references_info}
 Published: {cve_info['published']}
 
 Requirements:
-1. Create a valid Nuclei YAML template
+1. Create a valid Nuclei YAML template following the latest Nuclei template format
 2. Include appropriate HTTP requests for detection
-3. Add relevant matchers based on the vulnerability type
-4. Include proper metadata (author, severity, tags)
-5. Add meaningful description and references
-6. Consider the specific products/technologies affected
+3. Add relevant matchers based on the vulnerability type (status codes, response body, headers)
+4. Include proper metadata: id, name, author, severity, description, reference, tags, cvss-metrics, cvss-score, cve-id, cwe-id
+5. Use the exact severity value provided above in the info block
+6. Add meaningful description and all references listed above
+7. Consider the specific products/technologies affected when crafting requests and matchers
+8. For the tags field include: cve, {cve_info['id'].lower()}, and any relevant technology tags
 
-Return ONLY the YAML template without any additional text or explanations.
+Return ONLY the YAML template without any additional text, markdown code fences, or explanations.
 """
 
 def call_bedrock(prompt):
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-3-haiku-20240307-v1:0",
+        modelId="anthropic.claude-3-5-haiku-20241022-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2048,  # Increased for more detailed templates
-            "temperature": 0.2   # Lower temperature for more consistent output
+            "max_tokens": 4096,
+            "temperature": 0.2
         })
     )
     result = json.loads(response['body'].read())
@@ -173,18 +184,20 @@ def call_bedrock(prompt):
 @app.route('/generate', methods=['POST'])
 def generate():
     data = request.json
-    cve_id = data.get('cve_id') or data.get('id')
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    cve_id = (data.get('cve_id') or data.get('id') or '').strip().upper()
 
     if not cve_id:
         return jsonify({"error": "Missing CVE ID"}), 400
 
-    # Validate CVE ID format
-    if not cve_id.startswith('CVE-'):
-        return jsonify({"error": "Invalid CVE ID format. Must start with 'CVE-'"}), 400
+    if not CVE_ID_PATTERN.match(cve_id):
+        return jsonify({"error": "Invalid CVE ID format. Expected format: CVE-YYYY-NNNNN"}), 400
 
     cve_data = fetch_cve_nist(cve_id)
     if not cve_data:
-        return jsonify({"error": "CVE not found or API error"}), 404
+        return jsonify({"error": f"CVE {cve_id} not found in NVD or API error"}), 404
 
     try:
         cve_info = extract_cve_info(cve_data)
@@ -193,7 +206,7 @@ def generate():
 
         return jsonify({
             "template": template,
-            "cve_info": cve_info  # Optional: return structured data too
+            "cve_info": cve_info
         })
     except Exception as e:
         print(f"Error generating template for {cve_id}: {e}")
@@ -205,4 +218,3 @@ def health():
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
-```
