@@ -1,170 +1,198 @@
 from flask import Flask, request, jsonify
 import boto3
+import base64
 import json
+import os
 import re
 import requests
-import time
 
 app = Flask(__name__)
 
-# AWS Bedrock client
 bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
 
 CVE_ID_PATTERN = re.compile(r'^CVE-\d{4}-\d{4,}$', re.IGNORECASE)
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 
-def fetch_cve_nist(cve_id):
-    """Fetch CVE data from NIST NVD API 2.0"""
-    url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-    params = {'cveId': cve_id}
 
-    time.sleep(0.6)  # ~1.6 requests per second to stay under rate limit
+def fetch_exploitdb(cve_id):
+    """Search Exploit-DB for exploits matching the CVE ID."""
+    # Exploit-DB search expects just the numeric part e.g. 2021-44228
+    cve_num = cve_id[4:]  # strip 'CVE-'
 
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data.get('totalResults', 0) > 0:
-            return data['vulnerabilities'][0]['cve']
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching CVE {cve_id}: {e}")
-        return None
-
-def extract_cve_info(cve_data):
-    """Extract relevant information from NIST CVE data"""
-    cve_info = {
-        'id': cve_data.get('id', 'Unknown'),
-        'description': '',
-        'cvss_v3': None,
-        'cvss_v2': None,
-        'cvss_v4': None,
-        'cwe': [],
-        'references': [],
-        'cpe_configurations': [],
-        'published': cve_data.get('published', ''),
-        'modified': cve_data.get('lastModified', '')
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'X-Requested-With': 'XMLHttpRequest'
     }
 
-    # Extract English description
-    for desc in cve_data.get('descriptions', []):
-        if desc.get('lang') == 'en':
-            cve_info['description'] = desc.get('value', 'No description available')
-            break
+    try:
+        response = requests.get(
+            'https://www.exploit-db.com/search',
+            params={
+                'cve': cve_num,
+                'draw': '1',
+                'start': '0',
+                'length': '5'
+            },
+            headers=headers,
+            timeout=15
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        print(f"[Exploit-DB] Search failed for {cve_id}: {e}")
+        return []
 
-    metrics = cve_data.get('metrics', {})
-
-    # CVSS v4
-    cvss_v4 = metrics.get('cvssMetricV40')
-    if cvss_v4:
-        cvss_data = cvss_v4[0].get('cvssData', {})
-        cve_info['cvss_v4'] = {
-            'score': cvss_data.get('baseScore'),
-            'severity': cvss_data.get('baseSeverity'),
-            'vector': cvss_data.get('vectorString')
-        }
-
-    # CVSS v3.x
-    cvss_v3 = metrics.get('cvssMetricV31') or metrics.get('cvssMetricV30')
-    if cvss_v3:
-        cvss_data = cvss_v3[0].get('cvssData', {})
-        cve_info['cvss_v3'] = {
-            'score': cvss_data.get('baseScore'),
-            'severity': cvss_data.get('baseSeverity'),
-            'vector': cvss_data.get('vectorString')
-        }
-
-    # CVSS v2
-    cvss_v2 = metrics.get('cvssMetricV2')
-    if cvss_v2:
-        cvss_data = cvss_v2[0].get('cvssData', {})
-        cve_info['cvss_v2'] = {
-            'score': cvss_data.get('baseScore'),
-            'severity': cvss_data.get('baseSeverity'),
-            'vector': cvss_data.get('vectorString')
-        }
-
-    # CWE
-    for weakness in cve_data.get('weaknesses', []):
-        for desc in weakness.get('description', []):
-            if desc.get('lang') == 'en':
-                cve_info['cwe'].append(desc.get('value'))
-
-    # References (limit to 5)
-    for ref in cve_data.get('references', [])[:5]:
-        cve_info['references'].append({
-            'url': ref.get('url'),
-            'source': ref.get('source'),
-            'tags': ref.get('tags', [])
+    exploits = []
+    for item in data.get('data', [])[:3]:
+        exploit_id = item.get('id')
+        if not exploit_id:
+            continue
+        raw = _fetch_exploitdb_raw(exploit_id)
+        exploits.append({
+            'id': exploit_id,
+            'title': item.get('code', ''),
+            'type': item.get('type', {}).get('label', '') if isinstance(item.get('type'), dict) else item.get('type', ''),
+            'platform': item.get('platform', {}).get('label', '') if isinstance(item.get('platform'), dict) else item.get('platform', ''),
+            'date': item.get('date_published', ''),
+            'url': f'https://www.exploit-db.com/exploits/{exploit_id}',
+            'content': raw
         })
 
-    # Affected products from CPE configurations (limit to 10)
-    for config in cve_data.get('configurations', []):
-        for node in config.get('nodes', []):
-            for cpe_match in node.get('cpeMatch', []):
-                if cpe_match.get('vulnerable', False):
-                    cpe_uri = cpe_match.get('criteria', '')
-                    if cpe_uri and len(cve_info['cpe_configurations']) < 10:
-                        cve_info['cpe_configurations'].append(cpe_uri)
+    return exploits
 
-    return cve_info
 
-def generate_enhanced_prompt(cve_info):
-    """Generate enhanced prompt with structured CVE data"""
+def _fetch_exploitdb_raw(exploit_id):
+    """Fetch raw exploit file content from Exploit-DB."""
+    try:
+        response = requests.get(
+            f'https://www.exploit-db.com/raw/{exploit_id}',
+            timeout=10
+        )
+        if response.status_code == 200:
+            return response.text[:3000]
+    except Exception as e:
+        print(f"[Exploit-DB] Failed to fetch raw exploit {exploit_id}: {e}")
+    return ''
 
-    # Best available CVSS score
-    if cve_info['cvss_v4']:
-        cvss_info = f"CVSS v4: {cve_info['cvss_v4']['score']} ({cve_info['cvss_v4']['severity']}) - {cve_info['cvss_v4']['vector']}"
-    elif cve_info['cvss_v3']:
-        cvss_info = f"CVSS v3: {cve_info['cvss_v3']['score']} ({cve_info['cvss_v3']['severity']}) - {cve_info['cvss_v3']['vector']}"
-    elif cve_info['cvss_v2']:
-        cvss_info = f"CVSS v2: {cve_info['cvss_v2']['score']} ({cve_info['cvss_v2']['severity']}) - {cve_info['cvss_v2']['vector']}"
-    else:
-        cvss_info = "Not available"
 
-    cwe_info = ', '.join(cve_info['cwe']) if cve_info['cwe'] else 'Not specified'
+def fetch_github_pocs(cve_id):
+    """Search GitHub for PoC repositories related to the CVE."""
+    headers = {
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28'
+    }
+    if GITHUB_TOKEN:
+        headers['Authorization'] = f'Bearer {GITHUB_TOKEN}'
 
-    products = []
-    for cpe in cve_info['cpe_configurations'][:3]:
-        parts = cpe.split(':')
-        if len(parts) >= 5:
-            products.append(f"{parts[3]} {parts[4]}")
-    products_info = ', '.join(products) if products else 'Not specified'
+    results = []
 
-    ref_urls = [ref['url'] for ref in cve_info['references'][:3]]
-    references_info = '\n'.join(f"  - {url}" for url in ref_urls) if ref_urls else '  - Not available'
+    try:
+        response = requests.get(
+            'https://api.github.com/search/repositories',
+            params={
+                'q': f'{cve_id} poc',
+                'sort': 'stars',
+                'order': 'desc',
+                'per_page': 5
+            },
+            headers=headers,
+            timeout=10
+        )
+        response.raise_for_status()
+        items = response.json().get('items', [])
+    except Exception as e:
+        print(f"[GitHub] Search failed for {cve_id}: {e}")
+        return []
 
-    severity = 'unknown'
-    if cve_info['cvss_v4']:
-        severity = cve_info['cvss_v4']['severity'].lower()
-    elif cve_info['cvss_v3']:
-        severity = cve_info['cvss_v3']['severity'].lower()
-    elif cve_info['cvss_v2']:
-        severity = cve_info['cvss_v2']['severity'].lower()
+    for repo in items[:3]:
+        readme = _fetch_github_readme(repo.get('full_name', ''), headers)
+        results.append({
+            'name': repo.get('full_name'),
+            'url': repo.get('html_url'),
+            'description': repo.get('description') or '',
+            'stars': repo.get('stargazers_count', 0),
+            'readme': readme
+        })
 
-    return f"""You are a cybersecurity expert specializing in creating Nuclei templates. Create a comprehensive Nuclei template for the following CVE.
+    return results
 
-CVE ID: {cve_info['id']}
-Description: {cve_info['description']}
-Severity: {cvss_info}
-Nuclei severity field value: {severity}
-Weakness Type (CWE): {cwe_info}
-Affected Products: {products_info}
-References:
-{references_info}
-Published: {cve_info['published']}
 
-Requirements:
-1. Create a valid Nuclei YAML template following the latest Nuclei template format
-2. Include appropriate HTTP requests for detection
-3. Add relevant matchers based on the vulnerability type (status codes, response body, headers)
-4. Include proper metadata: id, name, author, severity, description, reference, tags, cvss-metrics, cvss-score, cve-id, cwe-id
-5. Use the exact severity value provided above in the info block
-6. Add meaningful description and all references listed above
-7. Consider the specific products/technologies affected when crafting requests and matchers
-8. For the tags field include: cve, {cve_info['id'].lower()}, and any relevant technology tags
+def _fetch_github_readme(repo_full_name, headers):
+    """Fetch and decode a GitHub repo's README."""
+    if not repo_full_name:
+        return ''
+    try:
+        response = requests.get(
+            f'https://api.github.com/repos/{repo_full_name}/readme',
+            headers=headers,
+            timeout=10
+        )
+        if response.status_code == 200:
+            encoded = response.json().get('content', '')
+            decoded = base64.b64decode(encoded).decode('utf-8', errors='ignore')
+            return decoded[:2000]
+    except Exception as e:
+        print(f"[GitHub] Failed to fetch README for {repo_full_name}: {e}")
+    return ''
 
-Return ONLY the YAML template without any additional text, markdown code fences, or explanations.
+
+def build_prompt(cve_id, exploits, github_pocs):
+    """Build the prompt for Bedrock using PoC data from Exploit-DB and GitHub."""
+
+    exploit_section = ''
+    if exploits:
+        for i, e in enumerate(exploits, 1):
+            exploit_section += f"""
+Exploit {i}:
+  Title: {e['title']}
+  Type: {e['type']}
+  Platform: {e['platform']}
+  URL: {e['url']}
+  Code:
+{e['content']}
 """
+    else:
+        exploit_section = 'No Exploit-DB entries found.'
+
+    github_section = ''
+    if github_pocs:
+        for i, repo in enumerate(github_pocs, 1):
+            github_section += f"""
+Repository {i}: {repo['name']} ({repo['stars']} stars)
+  URL: {repo['url']}
+  Description: {repo['description']}
+  README:
+{repo['readme']}
+"""
+    else:
+        github_section = 'No GitHub PoC repositories found.'
+
+    return f"""You are a cybersecurity expert specializing in creating Nuclei templates.
+
+Your task is to create a Nuclei detection template for {cve_id} based on the following real-world PoC data.
+
+---
+EXPLOIT-DB DATA:
+{exploit_section}
+
+---
+GITHUB POC DATA:
+{github_section}
+
+---
+Using the above PoC information, create a valid Nuclei YAML template that:
+1. Accurately detects the vulnerability described in the PoC material
+2. Uses the correct HTTP method, endpoint, headers, and payload derived from the PoCs
+3. Includes matchers based on actual response indicators shown in the PoC (status codes, response body strings, headers)
+4. Has complete metadata: id, name, author, severity, description, reference, tags, cve-id
+5. Sets severity based on the nature of the vulnerability (critical/high/medium/low)
+6. Includes the Exploit-DB and GitHub URLs in the references
+7. Tags include: cve, {cve_id.lower()}, and relevant technology tags based on the affected platform
+
+Return ONLY the YAML template. No explanations, no markdown code fences.
+"""
+
 
 def call_bedrock(prompt):
     response = bedrock.invoke_model(
@@ -181,6 +209,7 @@ def call_bedrock(prompt):
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
 
+
 @app.route('/generate', methods=['POST'])
 def generate():
     data = request.json
@@ -193,28 +222,34 @@ def generate():
         return jsonify({"error": "Missing CVE ID"}), 400
 
     if not CVE_ID_PATTERN.match(cve_id):
-        return jsonify({"error": "Invalid CVE ID format. Expected format: CVE-YYYY-NNNNN"}), 400
+        return jsonify({"error": "Invalid CVE ID format. Expected: CVE-YYYY-NNNNN"}), 400
 
-    cve_data = fetch_cve_nist(cve_id)
-    if not cve_data:
-        return jsonify({"error": f"CVE {cve_id} not found in NVD or API error"}), 404
+    exploits = fetch_exploitdb(cve_id)
+    github_pocs = fetch_github_pocs(cve_id)
+
+    if not exploits and not github_pocs:
+        return jsonify({"error": f"No PoC data found for {cve_id} on Exploit-DB or GitHub"}), 404
 
     try:
-        cve_info = extract_cve_info(cve_data)
-        prompt = generate_enhanced_prompt(cve_info)
+        prompt = build_prompt(cve_id, exploits, github_pocs)
         template = call_bedrock(prompt)
 
         return jsonify({
             "template": template,
-            "cve_info": cve_info
+            "sources": {
+                "exploitdb": [{"id": e['id'], "title": e['title'], "url": e['url']} for e in exploits],
+                "github": [{"repo": g['name'], "stars": g['stars'], "url": g['url']} for g in github_pocs]
+            }
         })
     except Exception as e:
         print(f"Error generating template for {cve_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "healthy"})
+
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
